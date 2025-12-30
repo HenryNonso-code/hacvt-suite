@@ -1,26 +1,28 @@
+import sys
+from pathlib import Path
+
+# ============================================================
+# Render-safe paths:
+# - Streamlit runs from /dashboard, so repo root isn't on sys.path.
+# - Add repo root so "import hacvt" works.
+# - Use absolute paths for dashboard/data files.
+# ============================================================
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+DASHBOARD_DIR = Path(__file__).resolve().parent
+DATA_DIR = DASHBOARD_DIR / "data"
+PROFILES_DIR = DASHBOARD_DIR / "profiles"
+
 # ===============================
-# HAC-VT Dashboard – Full Version (Updated)
+# HAC-VT Dashboard – Full Version (Render-ready)
 # ===============================
-# Run:
-#   pip install streamlit pandas numpy scikit-learn matplotlib
-#   streamlit run app.py
-#
-# This dashboard keeps your existing "metrics/confusion/explainability/dataset analysis"
-# views (from ./data/*.csv) and ADDS the missing features you requested:
-# - Upload any dataset CSV (not only car_reviews)
-# - Auto-detect text + label columns (with manual override)
-# - Star ratings (1–5) -> neg/neu/pos mapping
-# - Decision mode vs Evaluation mode (calibrate τ on dev for Macro-F1)
-# - Neutral behaviour controls: τ and κ
-# - Tier-1 standardization controls: delta_mean/bias/scale
-# - Optional adapter_path (confidence modifier)
-# - Single-text "Explain" panel (prediction + z + margin + LLs if available)
-# - Batch prediction + CSV download
-# - Confusion matrix + Macro-F1 when labels exist
 
 import os
 import json
 import re
+import inspect
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
@@ -37,14 +39,13 @@ st.title("HAC-VT Sentiment Analysis – Dashboard")
 
 
 # =========================================
-# 0) HAC-VT imports (edit only if your path differs)
+# 0) HAC-VT imports (robust)
 # =========================================
 HACVT_IMPORT_OK = True
 HACVT_IMPORT_ERR = None
 
-# IMPORTANT:
-# If your functions live somewhere else, change ONLY this import block.
 try:
+    # Function-based public API (as per your hacvt/model.py header)
     from hacvt.model import predict_one_gated_v2, log_likelihoods, best_label_and_margin
 except Exception as e:
     HACVT_IMPORT_OK = False
@@ -56,6 +57,7 @@ except Exception as e:
 # =========================================
 CANON = ["neg", "neu", "pos"]
 
+
 def _norm_str(x: Any) -> str:
     if x is None:
         return ""
@@ -63,14 +65,13 @@ def _norm_str(x: Any) -> str:
         return ""
     return str(x).strip().lower()
 
+
 def guess_text_column(df: pd.DataFrame) -> str:
-    # Prefer common names first
     common = {"text", "review", "content", "comment", "sentence", "headline", "title", "body"}
     for c in df.columns:
         if _norm_str(c) in common:
             return c
 
-    # Heuristic: object column with highest average string length
     obj_cols = [c for c in df.columns if df[c].dtype == "object"]
     if not obj_cols:
         return df.columns[0]
@@ -81,6 +82,7 @@ def guess_text_column(df: pd.DataFrame) -> str:
         avg_len[c] = s.map(len).mean()
     return max(avg_len, key=avg_len.get)
 
+
 def guess_label_column(df: pd.DataFrame) -> Optional[str]:
     common = {"label", "sentiment", "target", "y", "class", "rating", "stars", "star", "score"}
     for c in df.columns:
@@ -88,8 +90,10 @@ def guess_label_column(df: pd.DataFrame) -> Optional[str]:
             return c
     return None
 
+
 def ensure_text(s: pd.Series) -> pd.Series:
     return s.astype(str).fillna("").map(lambda x: x.strip())
+
 
 def detect_label_type(series: pd.Series) -> str:
     """
@@ -110,7 +114,6 @@ def detect_label_type(series: pd.Series) -> str:
     if numeric and nums and all(1.0 <= x <= 5.0 for x in nums):
         return "stars"
 
-    # basic canonical detection
     def canon(x: str) -> str:
         if x in {"neg", "negative"}:
             return "neg"
@@ -128,6 +131,7 @@ def detect_label_type(series: pd.Series) -> str:
         return "3class"
 
     return "unknown"
+
 
 def canonicalize_label(val: Any) -> str:
     v = _norm_str(val)
@@ -147,6 +151,7 @@ def canonicalize_label(val: Any) -> str:
 
     return v
 
+
 def map_star_to_sentiment(stars: Any, neutral_is_three: bool = True) -> str:
     try:
         s = float(stars)
@@ -162,22 +167,22 @@ def map_star_to_sentiment(stars: Any, neutral_is_three: bool = True) -> str:
 
 
 # =========================================
-# 2) Profiles (optional) + calibration controls
+# 2) Profiles (optional)
 # =========================================
-def list_profiles(profile_dir: str = "profiles") -> Dict[str, str]:
-    out = {}
-    if os.path.isdir(profile_dir):
-        for fn in os.listdir(profile_dir):
-            if fn.lower().endswith(".json"):
-                out[fn] = os.path.join(profile_dir, fn)
+def list_profiles(profile_dir: Path = PROFILES_DIR) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if profile_dir.is_dir():
+        for p in profile_dir.glob("*.json"):
+            out[p.name] = str(p)
     return out
+
 
 def load_profile_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def profile_from_json(name: str, j: Dict[str, Any]) -> Dict[str, Any]:
-    # tolerant to missing keys
     return {
         "name": name,
         "tau": float(j.get("tau", 0.20)),
@@ -202,23 +207,41 @@ def hacvt_predict_explain(
     adapter_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Calls your HAC-VT functions. If your API differs, edit ONLY this function.
+    Signature-safe call:
+    - If v2 accepts adapter_path, pass it.
+    - Else if v2 accepts adapter, load JSON if provided and pass adapter.
+    - Else call without adapter.
     """
     if not HACVT_IMPORT_OK:
         raise RuntimeError(f"HAC-VT import failed: {HACVT_IMPORT_ERR}")
 
-    lls = log_likelihoods(text)  # expected dict-like or tuple-like
-    best_label, margin = best_label_and_margin(text)  # (label, margin)
+    lls = log_likelihoods(text)
+    best_label, margin = best_label_and_margin(text)
 
-    pred = predict_one_gated_v2(
+    adapter_obj = None
+    if adapter_path:
+        try:
+            with open(adapter_path, "r", encoding="utf-8") as f:
+                adapter_obj = json.load(f)
+        except Exception:
+            adapter_obj = None
+
+    sig = inspect.signature(predict_one_gated_v2)
+    kwargs = dict(
         text=text,
         tau=tau,
         delta_mean=delta_mean,
         delta_bias=delta_bias,
         delta_scale=delta_scale,
         kappa=kappa,
-        adapter_path=adapter_path,
     )
+
+    if "adapter_path" in sig.parameters:
+        kwargs["adapter_path"] = adapter_path
+    elif "adapter" in sig.parameters:
+        kwargs["adapter"] = adapter_obj
+
+    pred = predict_one_gated_v2(**kwargs)
 
     # Best-effort delta/z
     ll_neg = ll_pos = delta = z = None
@@ -230,24 +253,16 @@ def hacvt_predict_explain(
     except Exception:
         pass
 
-    # ---------------------------------------------------------
-    # NEW: Decision-path fields (UI-only, no logic change)
-    # ---------------------------------------------------------
     band_status = None
     gate_status = "n/a"
-
     if z is not None:
         band_status = "inside" if (-float(tau) <= float(z) <= float(tau)) else "outside"
         if band_status == "inside":
             gate_status = "pass" if (margin is not None and float(margin) >= float(kappa)) else "fail"
 
-    # Reason (best-effort, aligned with what user sees)
     reason = "outside_tau_or_not_neutral"
     if band_status == "inside":
-        if gate_status == "fail":
-            reason = "inside_tau_stay_neu_margin_lt_kappa"
-        else:
-            reason = "inside_tau_flip_if_margin_ge_kappa"
+        reason = "inside_tau_stay_neu_margin_lt_kappa" if gate_status == "fail" else "inside_tau_flip_if_margin_ge_kappa"
 
     return {
         "text": text,
@@ -264,6 +279,7 @@ def hacvt_predict_explain(
         "reason": reason,
     }
 
+
 def hacvt_batch_predict(texts: List[str], params: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for t in texts:
@@ -276,22 +292,25 @@ def hacvt_batch_predict(texts: List[str], params: Dict[str, Any]) -> pd.DataFram
             delta_scale=params["delta_scale"],
             adapter_path=params.get("adapter_path", None),
         )
-        rows.append({
-            "pred_label": out["pred"],
-            "band_status": out["band_status"],
-            "gate_status": out["gate_status"],
-            "reason": out["reason"],
-            "margin": out["margin"],
-            "z": out["z"],
-            "delta": out["delta"],
-        })
+        rows.append(
+            {
+                "pred_label": out["pred"],
+                "band_status": out["band_status"],
+                "gate_status": out["gate_status"],
+                "reason": out["reason"],
+                "margin": out["margin"],
+                "z": out["z"],
+                "delta": out["delta"],
+            }
+        )
     return pd.DataFrame(rows)
+
 
 def calibrate_tau_on_dev(
     dev_texts: List[str],
     dev_labels: List[str],
     base_params: Dict[str, Any],
-    tau_grid: np.ndarray
+    tau_grid: np.ndarray,
 ) -> Tuple[float, float]:
     """
     Scan tau to maximize macro-F1 on dev. Keeps other params fixed.
@@ -314,35 +333,38 @@ def calibrate_tau_on_dev(
 
 
 # =========================================
-# 4) Existing CSV loaders (your current pipeline outputs)
+# 4) Existing CSV loaders (Render-safe paths)
 # =========================================
 @st.cache_data
 def load_metrics():
-    return pd.read_csv("data/metrics_summary.csv")
+    return pd.read_csv(DATA_DIR / "metrics_summary.csv")
+
 
 @st.cache_data
 def load_confusions():
-    cm_vader = pd.read_csv("data/confusion_vader.csv", index_col=0)
-    cm_textblob = pd.read_csv("data/confusion_textblob.csv", index_col=0)
-    cm_hacvt = pd.read_csv("data/confusion_hacvt.csv", index_col=0)
+    cm_vader = pd.read_csv(DATA_DIR / "confusion_vader.csv", index_col=0)
+    cm_textblob = pd.read_csv(DATA_DIR / "confusion_textblob.csv", index_col=0)
+    cm_hacvt = pd.read_csv(DATA_DIR / "confusion_hacvt.csv", index_col=0)
     return cm_vader, cm_textblob, cm_hacvt
+
 
 @st.cache_data
 def load_hacvt_data():
-    delta_df = pd.read_csv("data/delta_scores_hacvt.csv")
-    examples_df = pd.read_csv("data/hacvt_examples.csv")
+    delta_df = pd.read_csv(DATA_DIR / "delta_scores_hacvt.csv")
+    examples_df = pd.read_csv(DATA_DIR / "hacvt_examples.csv")
     return delta_df, examples_df
+
 
 @st.cache_data
 def list_local_datasets():
     """
-    List all CSV files in data/ treated as datasets
+    List all CSV files in dashboard/data/ treated as datasets
     (excluding metrics/confusions/delta/examples).
     """
-    if not os.path.isdir("data"):
+    if not DATA_DIR.is_dir():
         return {}
 
-    all_csv = [f for f in os.listdir("data") if f.lower().endswith(".csv")]
+    all_csv = [p.name for p in DATA_DIR.glob("*.csv")]
     exclude = {
         "metrics_summary.csv",
         "confusion_vader.csv",
@@ -352,11 +374,11 @@ def list_local_datasets():
         "hacvt_examples.csv",
     }
     dataset_files = [f for f in all_csv if f not in exclude]
-    return {name: os.path.join("data", name) for name in dataset_files}
+    return {name: str(DATA_DIR / name) for name in dataset_files}
 
 
 # =========================================
-# 5) Sidebar: model controls (τ/κ, tier-1, adapter, profiles, mode)
+# 5) Sidebar controls
 # =========================================
 st.sidebar.header("HAC-VT Controls")
 
@@ -366,13 +388,11 @@ if not HACVT_IMPORT_OK:
 else:
     st.sidebar.success("HAC-VT import OK")
 
-profiles = list_profiles("profiles")
+profiles = list_profiles(PROFILES_DIR)
 profile_choice = st.sidebar.selectbox(
-    "Profile (optional)",
-    options=["(Default built-in)"] + list(profiles.keys())
+    "Profile (optional)", options=["(Default built-in)"] + list(profiles.keys())
 )
 
-# Default params
 params = {
     "name": "default",
     "tau": 0.20,
@@ -383,7 +403,6 @@ params = {
     "adapter_path": None,
 }
 
-# Load selected profile if any
 if profile_choice != "(Default built-in)":
     try:
         pj = load_profile_json(profiles[profile_choice])
@@ -401,34 +420,30 @@ params["delta_bias"] = st.sidebar.number_input("delta_bias", value=float(params[
 params["delta_scale"] = st.sidebar.number_input("delta_scale", value=float(params["delta_scale"]), min_value=1e-9)
 
 st.sidebar.subheader("Adapter (optional)")
-adapter_override = st.sidebar.text_input("adapter_path", value=params["adapter_path"] or "")
+adapter_override = st.sidebar.text_input("adapter_path (optional JSON)", value=params["adapter_path"] or "")
 params["adapter_path"] = adapter_override.strip() if adapter_override.strip() else None
 
 mode = st.sidebar.radio(
     "Mode",
-    options=[
-        "Decision mode (default)",
-        "Evaluation mode (calibrate τ if labels exist)"
-    ],
-    index=0
+    options=["Decision mode (default)", "Evaluation mode (calibrate τ if labels exist)"],
+    index=0,
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Tip: Use Decision mode for general use. Use Evaluation mode when labels exist and you want Macro-F1 alignment.")
+st.sidebar.caption("Tip: Decision mode for general use. Evaluation mode when labels exist and you want Macro-F1 alignment.")
 
 
 # =========================================
-# 6) Load your existing outputs (if present)
+# 6) Load saved outputs if present
 # =========================================
-data_ok = os.path.isdir("data")
+data_ok = DATA_DIR.is_dir()
 
 metrics_df = None
 cm_vader = cm_textblob = cm_hacvt = None
 delta_df = examples_df = None
-local_datasets = {}
+local_datasets: Dict[str, str] = {}
 
 if data_ok:
-    # Load what exists (be tolerant)
     try:
         metrics_df = load_metrics()
     except Exception:
@@ -462,15 +477,16 @@ tab_metrics, tab_confusion, tab_explain, tab_live, tab_data = st.tabs(
         "Confusion Matrices",
         "Explainability (Saved HAC-VT)",
         "Live HAC-VT (Predict + Explain)",
-        "Dataset Analysis"
+        "Dataset Analysis",
     ]
 )
+
 
 # =====================================
 # TAB 1 — METRICS OVERVIEW
 # =====================================
 with tab_metrics:
-    st.markdown("This tab shows the summary metrics from `data/metrics_summary.csv` (if present).")
+    st.markdown("This tab shows the summary metrics from `dashboard/data/metrics_summary.csv` (if present).")
 
     if metrics_df is None:
         st.warning("metrics_summary.csv not found (or could not be read).")
@@ -539,31 +555,36 @@ with tab_explain:
     else:
         tau_low = tau_high = None
         if metrics_df is not None and "tau_low" in metrics_df.columns and "tau_high" in metrics_df.columns:
-            row = metrics_df[metrics_df.get("model") == "HAC-VT"] if "model" in metrics_df.columns else pd.DataFrame()
-            if not row.empty:
-                try:
-                    if pd.notna(row["tau_low"].iloc[0]): tau_low = float(row["tau_low"].iloc[0])
-                    if pd.notna(row["tau_high"].iloc[0]): tau_high = float(row["tau_high"].iloc[0])
-                except Exception:
-                    pass
+            try:
+                row = metrics_df[metrics_df["model"] == "HAC-VT"] if "model" in metrics_df.columns else pd.DataFrame()
+                if not row.empty:
+                    if pd.notna(row["tau_low"].iloc[0]):
+                        tau_low = float(row["tau_low"].iloc[0])
+                    if pd.notna(row["tau_high"].iloc[0]):
+                        tau_high = float(row["tau_high"].iloc[0])
+            except Exception:
+                pass
 
         col_left, col_right = st.columns([2, 1])
 
         with col_left:
             fig3, ax3 = plt.subplots()
-            ax3.hist(delta_df["delta"], bins=40)
-            ax3.set_xlabel("Δ score (LL_pos − LL_neg)")
-            ax3.set_ylabel("Count")
-            ax3.set_title("HAC-VT Δ-Score Distribution")
+            if "delta" in delta_df.columns:
+                ax3.hist(delta_df["delta"], bins=40)
+                ax3.set_xlabel("Δ score (LL_pos − LL_neg)")
+                ax3.set_ylabel("Count")
+                ax3.set_title("HAC-VT Δ-Score Distribution")
 
-            if tau_low is not None:
-                ax3.axvline(tau_low, linestyle="--", label="τ_low")
-            if tau_high is not None:
-                ax3.axvline(tau_high, linestyle="--", label="τ_high")
-            if tau_low is not None or tau_high is not None:
-                ax3.legend()
+                if tau_low is not None:
+                    ax3.axvline(tau_low, linestyle="--", label="τ_low")
+                if tau_high is not None:
+                    ax3.axvline(tau_high, linestyle="--", label="τ_high")
+                if tau_low is not None or tau_high is not None:
+                    ax3.legend()
 
-            st.pyplot(fig3)
+                st.pyplot(fig3)
+            else:
+                st.warning("delta_scores_hacvt.csv does not contain a 'delta' column.")
 
         with col_right:
             st.markdown(
@@ -597,26 +618,26 @@ with tab_explain:
             row = filtered.iloc[idx]
 
             st.markdown("### Review Text")
-            if "text" in row:
-                st.write(row["text"])
+            if "text" in filtered.columns:
+                st.write(row.get("text", ""))
             else:
                 st.write(row.to_dict())
 
-            if "true_label" in row and "pred_label" in row:
+            if "true_label" in filtered.columns and "pred_label" in filtered.columns:
                 st.markdown("### Labels")
                 st.write(f"- True label: **{row['true_label']}**")
                 st.write(f"- Predicted (HAC-VT): **{row['pred_label']}**")
-                if "correct" in row:
+                if "correct" in filtered.columns:
                     st.write(f"- Correctly classified: **{bool(row['correct'])}**")
 
-            if "delta" in row:
+            if "delta" in row.index:
                 st.markdown("### HAC-VT Decision")
                 try:
                     st.write(f"- Δ score: `{float(row['delta']):.4f}`")
                 except Exception:
                     st.write(f"- Δ score: `{row['delta']}`")
 
-            if "explanation" in examples_df.columns and isinstance(row.get("explanation", ""), str) and row["explanation"].strip():
+            if "explanation" in filtered.columns and isinstance(row.get("explanation", ""), str) and row["explanation"].strip():
                 st.markdown("### Explanation (Token Contributions)")
                 st.write(row["explanation"])
             else:
@@ -632,7 +653,7 @@ with tab_live:
     st.subheader("Live HAC-VT (Type text + Analyse)")
 
     if not HACVT_IMPORT_OK:
-        st.error("HAC-VT is not importable in this environment. Fix the import block at the top of app.py.")
+        st.error("HAC-VT is not importable in this environment.")
         st.code(HACVT_IMPORT_ERR)
     else:
         st.markdown("### 1) Type a text and analyse (no dataset needed)")
@@ -642,7 +663,7 @@ with tab_live:
             "It does the job.",
             "Average experience.",
             "Not good at all.",
-            "I love this car, but the mileage is terrible."
+            "I love this car, but the mileage is terrible.",
         ]
 
         sample_pick = st.selectbox("Quick sample (optional)", ["(Type my own)"] + default_samples, index=0)
@@ -652,7 +673,7 @@ with tab_live:
             "Enter text",
             value=single_text,
             height=140,
-            placeholder="Type any review/comment here..."
+            placeholder="Type any review/comment here...",
         )
 
         colA, colB = st.columns([1, 1])
@@ -673,13 +694,12 @@ with tab_live:
                     )
 
                     st.success(f"Prediction: {out['pred']}")
-
                     st.write("**Decision details**")
                     st.write(f"- best_label (raw): {out['best_label']}")
                     st.write(f"- margin: {out['margin']}")
                     st.write(f"- z: {out['z']}")
-                    st.write(f"- band_status: {out['band_status']} (|z| {'<=' if out['band_status']=='inside' else '>'} τ)" if out["band_status"] else "- band_status: n/a")
-                    st.write(f"- gate_status: {out['gate_status']} (margin {'>=' if out['gate_status']=='pass' else '<'} κ)" if out["gate_status"] in {"pass","fail"} else f"- gate_status: {out['gate_status']}")
+                    st.write(f"- band_status: {out['band_status']}" if out["band_status"] else "- band_status: n/a")
+                    st.write(f"- gate_status: {out['gate_status']}")
                     st.write(f"- reason: {out['reason']}")
 
         with colB:
@@ -700,16 +720,9 @@ with tab_live:
                     st.json(out_ll["lls"])
 
         st.markdown("---")
-
         st.markdown("### 2) Dataset mode (optional): upload CSV for batch predictions")
 
-        # ✅ FIXED: st.radio returns a string; it is NOT a context manager.
-        source = st.radio(
-            "Dataset source",
-            ["Upload CSV", "Load from ./data"],
-            index=0,
-            key="live_src"
-        )
+        source = st.radio("Dataset source", ["Upload CSV", "Load from dashboard/data"], index=0, key="live_src")
 
         live_df = None
         if source == "Upload CSV":
@@ -717,15 +730,15 @@ with tab_live:
             if up is not None:
                 live_df = pd.read_csv(up)
         else:
-            if not os.path.isdir("data"):
-                st.warning("No ./data folder found.")
+            if not DATA_DIR.is_dir():
+                st.warning("No dashboard/data folder found.")
             else:
-                candidates = [f for f in os.listdir("data") if f.lower().endswith(".csv")]
+                candidates = [p.name for p in DATA_DIR.glob("*.csv")]
                 if not candidates:
-                    st.warning("No CSV files found in ./data.")
+                    st.warning("No CSV files found in dashboard/data.")
                 else:
-                    pick = st.selectbox("Select a CSV from ./data", candidates, key="live_local_pick")
-                    live_df = pd.read_csv(os.path.join("data", pick))
+                    pick = st.selectbox("Select a CSV from dashboard/data", candidates, key="live_local_pick")
+                    live_df = pd.read_csv(DATA_DIR / pick)
 
         if live_df is None:
             st.info("Dataset mode is optional. Upload a CSV only if you want batch predictions/evaluation.")
@@ -743,7 +756,7 @@ with tab_live:
                     "Text column",
                     options=list(live_df.columns),
                     index=list(live_df.columns).index(default_text),
-                    key="live_text_col"
+                    key="live_text_col",
                 )
 
             with c2:
@@ -751,7 +764,7 @@ with tab_live:
                     "Label column (optional)",
                     options=["(None)"] + list(live_df.columns),
                     index=(0 if default_label is None else 1 + list(live_df.columns).index(default_label)),
-                    key="live_label_col"
+                    key="live_label_col",
                 )
 
             with c3:
@@ -759,7 +772,7 @@ with tab_live:
                     "If labels exist, treat as",
                     options=["Auto-detect", "3-class", "Binary", "Stars (1–5)"],
                     index=0,
-                    key="live_label_policy"
+                    key="live_label_policy",
                 )
 
             texts = ensure_text(live_df[text_col]).tolist()
@@ -785,7 +798,6 @@ with tab_live:
                     y = live_df[label_col].map(lambda v: map_star_to_sentiment(v, neutral_is_three=neutral_is_three))
                 else:
                     y = live_df[label_col].map(canonicalize_label)
-                    y = y.map(lambda v: v if v in CANON else v)
 
                 st.write("Label distribution (after mapping):")
                 st.write(pd.Series(y).value_counts(dropna=False))
@@ -798,7 +810,7 @@ with tab_live:
                 min_value=10,
                 max_value=max(10, len(texts)),
                 value=min(2000, len(texts)),
-                key="live_max_rows"
+                key="live_max_rows",
             )
 
             run_texts = texts[: int(max_rows)]
@@ -815,7 +827,7 @@ with tab_live:
                     "Download predictions CSV",
                     data=out_df.to_csv(index=False).encode("utf-8"),
                     file_name="hacvt_predictions.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
 
                 if y is not None:
@@ -849,21 +861,21 @@ with tab_live:
                                     dev_texts=list(np.array(run_texts)[mask]),
                                     dev_labels=list(y_eval),
                                     base_params=params,
-                                    tau_grid=tau_grid
+                                    tau_grid=tau_grid,
                                 )
                                 st.success(f"Best τ = {best_tau:.3f}  |  Dev Macro-F1 = {best_f1:.4f}")
                                 st.info("Copy this τ into the sidebar (τ slider) to lock it in for this dataset.")
 
 
 # =====================================
-# TAB 5 — DATASET ANALYSIS (your original tab, enhanced)
+# TAB 5 — DATASET ANALYSIS
 # =====================================
 with tab_data:
     st.subheader("Dataset Upload and Analysis")
 
     st.markdown(
         """
-        Choose one of the local datasets discovered in the `data/` folder
+        Choose one of the local datasets discovered in the `dashboard/data/` folder
         or switch to an uploaded CSV for ad-hoc analysis.
         """
     )
@@ -872,7 +884,7 @@ with tab_data:
     local_options = list(local_datasets.keys())
     has_local = len(local_options) > 0
 
-    options = []
+    options: List[str] = []
     if has_local:
         options.extend(local_options)
     options.append("Uploaded CSV")
@@ -896,9 +908,9 @@ with tab_data:
         if path and os.path.exists(path):
             data_df = pd.read_csv(path)
             source_label = f"Local dataset: {dataset_choice}"
-            st.info(f"Using local dataset: `{dataset_choice}` from the data/ folder.")
+            st.info(f"Using local dataset: `{dataset_choice}` from the dashboard/data folder.")
         else:
-            st.error(f"File for dataset `{dataset_choice}` not found in data/.")
+            st.error(f"File for dataset `{dataset_choice}` not found in dashboard/data.")
 
     if data_df is not None:
         st.markdown("### Basic Information")
@@ -917,7 +929,7 @@ with tab_data:
             "Select the label / rating column",
             options=list(data_df.columns),
             index=0,
-            key="analysis_label_col"
+            key="analysis_label_col",
         )
 
         value_counts = data_df[col_name].value_counts(dropna=False).sort_index()

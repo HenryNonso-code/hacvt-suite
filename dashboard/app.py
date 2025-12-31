@@ -76,7 +76,7 @@ def guess_text_column(df: pd.DataFrame) -> str:
     if not obj_cols:
         return df.columns[0]
 
-    avg_len = {}
+    avg_len: Dict[str, float] = {}
     for c in obj_cols:
         s = df[c].astype(str).fillna("")
         avg_len[c] = s.map(len).mean()
@@ -104,7 +104,7 @@ def detect_label_type(series: pd.Series) -> str:
 
     # stars: numeric 1..5
     numeric = True
-    nums = []
+    nums: List[float] = []
     for u in uniq:
         try:
             nums.append(float(u))
@@ -211,6 +211,10 @@ def hacvt_predict_explain(
     - If v2 accepts adapter_path, pass it.
     - Else if v2 accepts adapter, load JSON if provided and pass adapter.
     - Else call without adapter.
+
+    UI clarity:
+    - band_status becomes "inside (|z| ≤ τ)" or "outside (|z| > τ)".
+    - gate_status shows pass/fail only when inside the neutral band.
     """
     if not HACVT_IMPORT_OK:
         raise RuntimeError(f"HAC-VT import failed: {HACVT_IMPORT_ERR}")
@@ -227,7 +231,7 @@ def hacvt_predict_explain(
             adapter_obj = None
 
     sig = inspect.signature(predict_one_gated_v2)
-    kwargs = dict(
+    kwargs: Dict[str, Any] = dict(
         text=text,
         tau=tau,
         delta_mean=delta_mean,
@@ -253,15 +257,20 @@ def hacvt_predict_explain(
     except Exception:
         pass
 
-    band_status = None
-    gate_status = "n/a"
+    # ---------- UPDATED: band_status wording with (|z| ≤ τ) / (|z| > τ) ----------
+    band_status: Optional[str] = None
+    gate_status: str = "n/a"
+
     if z is not None:
-        band_status = "inside" if (-float(tau) <= float(z) <= float(tau)) else "outside"
-        if band_status == "inside":
+        if -float(tau) <= float(z) <= float(tau):
+            band_status = "inside (|z| ≤ τ)"
             gate_status = "pass" if (margin is not None and float(margin) >= float(kappa)) else "fail"
+        else:
+            band_status = "outside (|z| > τ)"
+            gate_status = "n/a"
 
     reason = "outside_tau_or_not_neutral"
-    if band_status == "inside":
+    if band_status is not None and band_status.startswith("inside"):
         reason = "inside_tau_stay_neu_margin_lt_kappa" if gate_status == "fail" else "inside_tau_flip_if_margin_ge_kappa"
 
     return {
@@ -281,7 +290,7 @@ def hacvt_predict_explain(
 
 
 def hacvt_batch_predict(texts: List[str], params: Dict[str, Any]) -> pd.DataFrame:
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for t in texts:
         out = hacvt_predict_explain(
             text=t,
@@ -393,7 +402,7 @@ profile_choice = st.sidebar.selectbox(
     "Profile (optional)", options=["(Default built-in)"] + list(profiles.keys())
 )
 
-params = {
+params: Dict[str, Any] = {
     "name": "default",
     "tau": 0.20,
     "kappa": 0.00,
@@ -778,7 +787,6 @@ with tab_live:
             texts = ensure_text(live_df[text_col]).tolist()
 
             y = None
-            label_type = "none"
 
             if label_col != "(None)":
                 detected = detect_label_type(live_df[label_col])
@@ -790,10 +798,9 @@ with tab_live:
                 elif label_policy.startswith("Stars"):
                     detected = "stars"
 
-                label_type = detected
-                st.write(f"Detected label type: **{label_type}**")
+                st.write(f"Detected label type: **{detected}**")
 
-                if label_type == "stars":
+                if detected == "stars":
                     neutral_is_three = st.checkbox("Map 3 stars to Neutral (recommended)", value=True, key="live_neu3")
                     y = live_df[label_col].map(lambda v: map_star_to_sentiment(v, neutral_is_three=neutral_is_three))
                 else:
@@ -846,7 +853,11 @@ with tab_live:
                         st.write(f"**Macro-F1:** {macro:.4f}")
 
                         cm = confusion_matrix(y_eval, y_pred, labels=CANON)
-                        cm_df = pd.DataFrame(cm, index=[f"true_{c}" for c in CANON], columns=[f"pred_{c}" for c in CANON])
+                        cm_df = pd.DataFrame(
+                            cm,
+                            index=[f"true_{c}" for c in CANON],
+                            columns=[f"pred_{c}" for c in CANON],
+                        )
                         st.write("Confusion matrix")
                         st.dataframe(cm_df, use_container_width=True)
 
